@@ -331,9 +331,11 @@ func newReportConnection(rule ReportRule) *reportConnection {
 		if err != nil {
 			msg = err.Error()
 		}
+		reportLog.WARN.Printf("%s: upstream disconnected: %s", conn.title, msg)
 		recordReportError(conn.rule.LoadpointId, msg)
 	})
 	endpoint.SetOnReconnectedHandler(func() {
+		reportLog.INFO.Printf("%s: upstream reconnected", conn.title)
 		clearReportError(conn.rule.LoadpointId)
 		conn.mu.Lock()
 		conn.booted = false // re-boot after reconnect
@@ -443,9 +445,11 @@ func (conn *reportConnection) dial() {
 		default:
 		}
 		if err := conn.cp.Start(conn.rule.UpstreamURL); err != nil {
+			reportLog.WARN.Printf("%s: connect %s: %v", conn.title, conn.rule.UpstreamURL, err)
 			recordReportError(conn.rule.LoadpointId, err.Error())
 			return err
 		}
+		reportLog.INFO.Printf("%s: connected to %s as %s", conn.title, conn.rule.UpstreamURL, conn.rule.StationID)
 		// always notify on a successful connect, even if no prior error was
 		// recorded (e.g. the very first attempt succeeds) - the UI still
 		// needs to see the connected transition
@@ -612,7 +616,7 @@ func (conn *reportConnection) sendStart(ev reportEvent) error {
 
 	auth, err := conn.cp.Authorize(idTag)
 	if err != nil {
-		reportLog.DEBUG.Printf("%s: authorize: %v", conn.title, err)
+		reportLog.WARN.Printf("%s: authorize: %v", conn.title, err)
 		return err
 	}
 	if auth.IdTagInfo != nil {
@@ -621,12 +625,14 @@ func (conn *reportConnection) sendStart(ev reportEvent) error {
 
 	res, err := conn.cp.StartTransaction(1, idTag, int(ev.wh), types.NewDateTime(ev.at))
 	if err != nil {
-		reportLog.DEBUG.Printf("%s: start transaction: %v", conn.title, err)
+		reportLog.WARN.Printf("%s: start transaction: %v", conn.title, err)
 		return err
 	}
 	if res.IdTagInfo != nil {
 		conn.noteIdTagStatus(res.IdTagInfo.Status)
 	}
+
+	reportLog.INFO.Printf("%s: transaction %d started at %dWh", conn.title, res.TransactionId, int(ev.wh))
 
 	conn.mu.Lock()
 	conn.transactionId = &res.TransactionId
@@ -643,6 +649,7 @@ func (conn *reportConnection) sendStart(ev reportEvent) error {
 // for the interval is kept at the head of the queue and sent by a later call.
 func (conn *reportConnection) sendMeter(ev reportEvent, next *reportEvent, txID *int) error {
 	if txID == nil {
+		reportLog.WARN.Printf("%s: dropping meter value %.0fWh, no open transaction", conn.title, ev.wh)
 		return nil
 	}
 
@@ -671,6 +678,7 @@ func (conn *reportConnection) sendMeter(ev reportEvent, next *reportEvent, txID 
 	}
 
 	conn.lastMeterSent = now
+	reportLog.DEBUG.Printf("%s: meter values sent: transaction %d, %.0fWh", conn.title, *txID, ev.wh)
 
 	conn.mu.Lock()
 	conn.persistLocked()
@@ -680,13 +688,16 @@ func (conn *reportConnection) sendMeter(ev reportEvent, next *reportEvent, txID 
 
 func (conn *reportConnection) sendStop(ev reportEvent, txID *int) error {
 	if txID == nil {
+		reportLog.WARN.Printf("%s: dropping stop at %.0fWh, no open transaction", conn.title, ev.wh)
 		return nil
 	}
 
 	if _, err := conn.cp.StopTransaction(int(ev.wh), types.NewDateTime(ev.at), *txID); err != nil {
-		reportLog.DEBUG.Printf("%s: stop transaction: %v", conn.title, err)
+		reportLog.WARN.Printf("%s: stop transaction: %v", conn.title, err)
 		return err
 	}
+
+	reportLog.INFO.Printf("%s: transaction %d stopped at %dWh", conn.title, *txID, int(ev.wh))
 
 	conn.mu.Lock()
 	conn.sessionActive = false
@@ -723,6 +734,8 @@ func ReportSessionStart(loadpointId int, meterStartWh float64) {
 	if conn == nil {
 		return
 	}
+
+	reportLog.INFO.Printf("%s: session start queued at %.0fWh", conn.title, meterStartWh)
 
 	conn.mu.Lock()
 	conn.sessionActive = true
@@ -771,6 +784,7 @@ func ReportSessionStop(loadpointId int, meterStopWh float64) {
 		return
 	}
 	conn.sessionActive = false
+	reportLog.INFO.Printf("%s: session stop queued at %.0fWh", conn.title, meterStopWh)
 	conn.push(reportEvent{kind: reportEventStop, at: time.Now(), wh: meterStopWh})
 	conn.mu.Unlock()
 
