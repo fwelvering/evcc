@@ -850,6 +850,7 @@
       "labelInsecure": "Certificate validation",
       "password": "Password",
       "passwordHelp": "For HTTP Basic Auth to the upstream server.",
+      "sharedHint": "This is one setting for the loadpoint and its charging station. You can reach it from the loadpoint card and from OCPP, Charging stations. Changes apply in both places.",
       "stationId": "Station ID",
       "stationIdHelp": "Identity presented to the upstream server. Required.",
       "status": "Status",

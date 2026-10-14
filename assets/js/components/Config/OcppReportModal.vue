@@ -27,6 +27,9 @@
 					connectionLabel
 				}}</span>
 			</p>
+			<div class="alert alert-info" role="note" data-testid="ocppreport-shared">
+				{{ $t("config.ocppreport.sharedHint") }}
+			</div>
 			<div
 				v-if="sessionError"
 				class="alert alert-danger"
