@@ -371,16 +371,14 @@ func TestPushPersistsSessionBoundaries(t *testing.T) {
 func TestSplitReportRules(t *testing.T) {
 	zeres := ReportRule{LoadpointId: 0, LoadpointTitle: "EVBox", UpstreamURL: "ws://ocpp.zeres.nl", StationID: "EVB-1"}
 
-	t.Run("separate identity", func(t *testing.T) {
-		own := zeres
-		own.StationID = "EVB-1-report"
-		active, refused := splitReportRules([]ReportRule{own}, map[string]bool{"EVB-1": true})
+	t.Run("same id, other upstream", func(t *testing.T) {
+		active, refused := splitReportRules([]ReportRule{zeres}, map[string][]string{"EVB-1": {"ws://ocpp.road.io/e-flux"}})
 		assert.Len(t, active, 1)
 		assert.Empty(t, refused)
 	})
 
-	t.Run("forwarder identity", func(t *testing.T) {
-		active, refused := splitReportRules([]ReportRule{zeres}, map[string]bool{"EVB-1": true})
+	t.Run("same id, same upstream as forwarder", func(t *testing.T) {
+		active, refused := splitReportRules([]ReportRule{zeres}, map[string][]string{"EVB-1": {"ws://ocpp.zeres.nl/"}})
 		assert.Empty(t, active)
 		assert.Contains(t, refused, 0)
 	})

@@ -218,31 +218,34 @@ func clearReportError(id int) {
 	}
 }
 
-// forwardedIdentities returns the station ids the forwarder presents to its upstreams.
-// Some upstreams relay on to a leading backoffice, so a report under one of these ids
-// would collide with the forwarder there.
-func forwardedIdentities() map[string]bool {
+// forwardedIdentities returns, per station id the forwarder presents upstream, the
+// upstream URLs it dials with it. A report to the same URL under the same id would
+// replace the forwarder's connection there.
+func forwardedIdentities() map[string][]string {
 	forwarderMu.RLock()
 	rules := slices.Clone(forwarderRules)
 	forwarderMu.RUnlock()
 
-	ids := make(map[string]bool)
-	wildcard := false
+	ids := make(map[string][]string)
+	var wildcard []string
 	for _, r := range rules {
+		url := strings.TrimRight(r.UpstreamURL, "/")
 		if r.StationID == "*" {
-			wildcard = true
+			wildcard = append(wildcard, url)
 			if r.UpstreamStationID != "" {
-				ids[strings.TrimLeft(r.UpstreamStationID, "/")] = true
+				id := strings.TrimLeft(r.UpstreamStationID, "/")
+				ids[id] = append(ids[id], url)
 			}
 			continue
 		}
-		ids[strings.TrimLeft(r.upstreamPath(r.StationID), "/")] = true
+		id := strings.TrimLeft(r.upstreamPath(r.StationID), "/")
+		ids[id] = append(ids[id], url)
 	}
 
-	if wildcard {
+	if len(wildcard) > 0 {
 		sidecarsMu.Lock()
 		for id := range connectedChargers {
-			ids[id] = true
+			ids[id] = append(ids[id], wildcard...)
 		}
 		sidecarsMu.Unlock()
 	}
@@ -251,17 +254,18 @@ func forwardedIdentities() map[string]bool {
 }
 
 // splitReportRules separates the rules that may dial from those that must not, keyed
-// by loadpoint id: a rule is refused when its station id is one the forwarder uses,
-// or when an earlier rule already dials the same upstream under the same station id.
-func splitReportRules(rules []ReportRule, forwarded map[string]bool) (active []ReportRule, refused map[int]string) {
+// by loadpoint id: a rule is refused when the forwarder already dials the same upstream
+// under the same station id, or when an earlier rule does.
+func splitReportRules(rules []ReportRule, forwarded map[string][]string) (active []ReportRule, refused map[int]string) {
 	refused = make(map[int]string)
 	dialed := make(map[string]bool)
 
 	for _, r := range rules {
-		key := strings.TrimRight(r.UpstreamURL, "/") + "|" + r.StationID
+		url := strings.TrimRight(r.UpstreamURL, "/")
+		key := url + "|" + r.StationID
 		switch {
-		case forwarded[r.StationID]:
-			refused[r.LoadpointId] = fmt.Sprintf("station id %s is used by the OCPP forwarder, the report needs its own", r.StationID)
+		case slices.ContainsFunc(forwarded[r.StationID], func(u string) bool { return strings.EqualFold(u, url) }):
+			refused[r.LoadpointId] = fmt.Sprintf("the OCPP forwarder already connects to this upstream as %s", r.StationID)
 		case dialed[key]:
 			refused[r.LoadpointId] = fmt.Sprintf("station id %s is already reported to this upstream by another rule", r.StationID)
 		default:
@@ -319,6 +323,12 @@ func ApplyReportRules(rules []ReportRule) {
 	if reportEnabled {
 		for _, r := range active {
 			reportLog.INFO.Printf("%s: report rule %s as %s", r.LoadpointTitle, r.UpstreamURL, r.StationID)
+		}
+		for _, r := range active {
+			if len(forwarded[r.StationID]) > 0 {
+				reportLog.WARN.Printf("%s: station id %s is also forwarded to %s, an upstream that relays both to one backoffice will see two connections",
+					r.LoadpointTitle, r.StationID, strings.Join(forwarded[r.StationID], ", "))
+			}
 		}
 		for id, msg := range refused {
 			reportLog.ERROR.Printf("loadpoint %d: report rule not started: %s", id, msg)
