@@ -5522,7 +5522,7 @@
             "type": "string"
           },
           "idTag": {
-            "description": "ID tag presented to the upstream backend for Authorize/StartTransaction.",
+            "description": "Optional ID tag presented to the upstream backend. Defaults to EVCC; Authorize is only sent when set.",
             "type": "string"
           },
           "username": {

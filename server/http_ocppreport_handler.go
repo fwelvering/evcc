@@ -19,9 +19,7 @@ func updateOcppReportHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// stationId and idTag are mandatory - no more "evcc-<loadpoint>" /
-	// "EVCC" fallbacks; an empty idTag would also silently and permanently
-	// fail every Authorize/StartTransaction (ocpp-go validates it required)
+	// stationId has no fallback, the upstream identifies the station by it
 	seen := make(map[int]bool, len(rules))
 	for _, rule := range rules {
 		if seen[rule.LoadpointId] {
@@ -31,10 +29,6 @@ func updateOcppReportHandler(w http.ResponseWriter, r *http.Request) {
 		seen[rule.LoadpointId] = true
 		if rule.StationID == "" {
 			jsonError(w, http.StatusBadRequest, fmt.Errorf("%s: stationId is required", rule.LoadpointTitle))
-			return
-		}
-		if rule.IdTag == "" {
-			jsonError(w, http.StatusBadRequest, fmt.Errorf("%s: idTag is required", rule.LoadpointTitle))
 			return
 		}
 	}

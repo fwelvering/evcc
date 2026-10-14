@@ -122,7 +122,6 @@
 					class="form-control"
 					spellcheck="false"
 					autocomplete="off"
-					required
 				/>
 			</FormRow>
 			<PropertyCollapsible>
@@ -175,7 +174,7 @@
 					v-if="changes"
 					type="button"
 					class="btn btn-primary order-1 order-sm-2 flex-grow-1 flex-sm-grow-0 px-4"
-					:disabled="!values.upstreamUrl || !values.stationId || !values.idTag"
+					:disabled="!values.upstreamUrl || !values.stationId"
 					@click="save(false)"
 				>
 					{{ $t("config.general.save") }}

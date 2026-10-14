@@ -50,6 +50,8 @@ const (
 	defaultMeterInterval     = 60 * time.Second
 	defaultHeartbeatInterval = 5 * time.Minute
 
+	defaultIdTag = "EVCC"
+
 	// resumeWindow is how long a session restored after a restart waits for the
 	// loadpoint to start its next session before the transaction is ended
 	resumeWindow = 10 * time.Minute
@@ -67,10 +69,8 @@ type ReportRule struct {
 	// StationID is mandatory - no more "evcc-<loadpoint>" fallback; a rule
 	// must name its own station explicitly.
 	StationID string `json:"stationId" yaml:"stationId"`
-	// IdTag is mandatory: the underlying ocpp-go library validates it
-	// `required` on every Authorize/StartTransaction, so an empty value
-	// would silently and permanently fail every session (see idTag's
-	// removed fallback - it used to default to "EVCC").
+	// IdTag is optional: StartTransaction requires one, so an empty value falls
+	// back to defaultIdTag and Authorize is skipped.
 	IdTag    string `json:"idTag" yaml:"idTag"`
 	Username string `json:"username,omitempty" yaml:"username,omitempty"`
 	Password string `json:"password,omitempty" yaml:"password,omitempty"`
@@ -725,14 +725,17 @@ func (conn *reportConnection) reconcile() {
 
 func (conn *reportConnection) sendStart(ev reportEvent) error {
 	idTag := conn.rule.IdTag
-
-	auth, err := conn.cp.Authorize(idTag)
-	if err != nil {
-		reportLog.WARN.Printf("%s: authorize: %v", conn.title, err)
-		return err
-	}
-	if auth.IdTagInfo != nil {
-		conn.noteIdTagStatus(auth.IdTagInfo.Status)
+	if idTag == "" {
+		idTag = defaultIdTag
+	} else {
+		auth, err := conn.cp.Authorize(idTag)
+		if err != nil {
+			reportLog.WARN.Printf("%s: authorize: %v", conn.title, err)
+			return err
+		}
+		if auth.IdTagInfo != nil {
+			conn.noteIdTagStatus(auth.IdTagInfo.Status)
+		}
 	}
 
 	res, err := conn.cp.StartTransaction(1, idTag, int(ev.wh), types.NewDateTime(ev.at))
