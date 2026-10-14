@@ -62,12 +62,13 @@
 											experimental &&
 											ocppReportEnabled &&
 											loadpoint.title &&
+											ocppReportLoadpointId(loadpoint) >= 0 &&
 											!loadpointIsHeating(loadpoint)
 										"
-										:loadpoint-id="loadpoint.id!"
-										:rule="ocppReportRule(loadpoint.id!)"
-										:connected="ocppReportConnected(loadpoint.id!)"
-										:error="ocppReportError(loadpoint.id!)"
+										:loadpoint-id="ocppReportLoadpointId(loadpoint)"
+										:rule="ocppReportRule(ocppReportLoadpointId(loadpoint))"
+										:connected="ocppReportConnected(ocppReportLoadpointId(loadpoint))"
+										:error="ocppReportError(ocppReportLoadpointId(loadpoint))"
 									/>
 								</div>
 							</template>
@@ -1740,6 +1741,9 @@ export default defineComponent({
 			// their circuit reference and no fatal error is ever reported for it
 			const { circuit } = loadpoint;
 			return !!circuit && !this.circuits.some((c) => c.name === circuit);
+		},
+		ocppReportLoadpointId(loadpoint: ConfigLoadpoint): number {
+			return (store.state?.loadpoints || []).findIndex((lp) => lp.title === loadpoint.title);
 		},
 		ocppReportRule(id: number) {
 			return (store.state?.ocppreport?.config || []).find((r) => r.loadpointId === id);

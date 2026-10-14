@@ -372,13 +372,13 @@ func TestSplitReportRules(t *testing.T) {
 	zeres := ReportRule{LoadpointId: 0, LoadpointTitle: "EVBox", UpstreamURL: "ws://ocpp.zeres.nl", StationID: "EVB-1"}
 
 	t.Run("same id, other upstream", func(t *testing.T) {
-		active, refused := splitReportRules([]ReportRule{zeres}, map[string][]string{"EVB-1": {"ws://ocpp.road.io/e-flux"}})
+		active, refused := splitReportRules([]ReportRule{zeres}, map[string][]string{"EVB-1": {"ws://ocpp.road.io/e-flux"}}, -1)
 		assert.Len(t, active, 1)
 		assert.Empty(t, refused)
 	})
 
 	t.Run("same id, same upstream as forwarder", func(t *testing.T) {
-		active, refused := splitReportRules([]ReportRule{zeres}, map[string][]string{"EVB-1": {"ws://ocpp.zeres.nl/"}})
+		active, refused := splitReportRules([]ReportRule{zeres}, map[string][]string{"EVB-1": {"ws://ocpp.zeres.nl/"}}, -1)
 		assert.Empty(t, active)
 		assert.Contains(t, refused, 0)
 	})
@@ -387,7 +387,16 @@ func TestSplitReportRules(t *testing.T) {
 		dup := zeres
 		dup.LoadpointId = 1
 		dup.UpstreamURL = "ws://ocpp.zeres.nl/"
-		active, refused := splitReportRules([]ReportRule{zeres, dup}, nil)
+		active, refused := splitReportRules([]ReportRule{zeres, dup}, nil, -1)
+		require.Len(t, active, 1)
+		assert.Equal(t, 0, active[0].LoadpointId)
+		assert.Contains(t, refused, 1)
+	})
+
+	t.Run("missing loadpoint", func(t *testing.T) {
+		stale := zeres
+		stale.LoadpointId = 1
+		active, refused := splitReportRules([]ReportRule{stale, zeres}, nil, 1)
 		require.Len(t, active, 1)
 		assert.Equal(t, 0, active[0].LoadpointId)
 		assert.Contains(t, refused, 1)

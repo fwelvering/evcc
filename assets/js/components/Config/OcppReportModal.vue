@@ -225,13 +225,17 @@ export default defineComponent({
 			return getModal("ocppreport")?.loadpoint ?? -1;
 		},
 		targetLoadpointTitle(): string {
-			return this.loadpoints.find((l) => l.id === this.targetLoadpointId)?.title || "";
+			return store.state?.loadpoints?.[this.targetLoadpointId]?.title || "";
 		},
 		defaultStationId(): string {
 			return `evcc-${this.targetLoadpointTitle}`;
 		},
 		rules(): OcppReportRule[] {
 			return store.state?.ocppreport?.config || [];
+		},
+		knownRules(): OcppReportRule[] {
+			const count = (store.state?.loadpoints || []).length;
+			return this.rules.filter((r) => r.loadpointId >= 0 && r.loadpointId < count);
 		},
 		ruleExists(): boolean {
 			return this.rules.some((r) => r.loadpointId === this.targetLoadpointId);
@@ -259,7 +263,7 @@ export default defineComponent({
 		// features can run in parallel, but pointed at the same backend they'd
 		// report the same session twice (see evcc-io/evcc#32989 discussion)
 		conflictingForwarderHost(): string | undefined {
-			const lp = this.loadpoints.find((l) => l.id === this.targetLoadpointId);
+			const lp = this.loadpoints.find((l) => l.title === this.targetLoadpointTitle);
 			const charger = lp && this.chargers.find((c) => c.name === lp.charger);
 			const stationId = charger?.config?.["stationid"] as string | undefined;
 			if (!stationId) return undefined;
@@ -291,7 +295,7 @@ export default defineComponent({
 		},
 		// merge the edited rule back into the complete set that gets persisted
 		transformWriteValues(rule: OcppReportRule): OcppReportRule[] {
-			const list = this.rules.map((r) => ({ ...r }));
+			const list = this.knownRules.map((r) => ({ ...r }));
 			const index = list.findIndex((r) => r.loadpointId === rule.loadpointId);
 			if (index >= 0) {
 				list[index] = rule;
@@ -303,7 +307,7 @@ export default defineComponent({
 		async removeRule() {
 			this.removing = true;
 			try {
-				const list = this.rules.filter((r) => r.loadpointId !== this.targetLoadpointId);
+				const list = this.knownRules.filter((r) => r.loadpointId !== this.targetLoadpointId);
 				const res = await api.post("/config/ocppreport", list, {
 					validateStatus: (code: number) => [200, 202, 400].includes(code),
 				});

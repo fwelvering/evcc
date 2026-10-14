@@ -1478,6 +1478,7 @@ func configureSite(conf map[string]any, loadpoints []*core.Loadpoint, tariffs *t
 	}
 
 	site.SetSessionReporter(ocpp.SessionReporter{})
+	ocpp.SetReportLoadpoints(len(loadpoints))
 
 	return site, nil
 }

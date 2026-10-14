@@ -119,6 +119,10 @@ var (
 	connections   = make(map[int]*reportConnection) // keyed by LoadpointId
 	reportErrors  = make(map[int]string)
 
+	// reportLoadpoints is the number of loadpoints, -1 until the site is booted;
+	// a rule for a loadpoint beyond it can never receive a session
+	reportLoadpoints = -1
+
 	reportCbMu      sync.Mutex
 	reportUpdatedCb func()
 )
@@ -256,7 +260,7 @@ func forwardedIdentities() map[string][]string {
 // splitReportRules separates the rules that may dial from those that must not, keyed
 // by loadpoint id: a rule is refused when the forwarder already dials the same upstream
 // under the same station id, or when an earlier rule does.
-func splitReportRules(rules []ReportRule, forwarded map[string][]string) (active []ReportRule, refused map[int]string) {
+func splitReportRules(rules []ReportRule, forwarded map[string][]string, loadpoints int) (active []ReportRule, refused map[int]string) {
 	refused = make(map[int]string)
 	dialed := make(map[string]bool)
 
@@ -264,6 +268,8 @@ func splitReportRules(rules []ReportRule, forwarded map[string][]string) (active
 		url := strings.TrimRight(r.UpstreamURL, "/")
 		key := url + "|" + r.StationID
 		switch {
+		case loadpoints >= 0 && (r.LoadpointId < 0 || r.LoadpointId >= loadpoints):
+			refused[r.LoadpointId] = fmt.Sprintf("loadpoint %d does not exist", r.LoadpointId)
 		case slices.ContainsFunc(forwarded[r.StationID], func(u string) bool { return strings.EqualFold(u, url) }):
 			refused[r.LoadpointId] = fmt.Sprintf("the OCPP forwarder already connects to this upstream as %s", r.StationID)
 		case dialed[key]:
@@ -281,9 +287,25 @@ func splitReportRules(rules []ReportRule, forwarded map[string][]string) (active
 	return active, refused
 }
 
+// SetReportLoadpoints tells the report how many loadpoints exist, so rules for
+// missing ones are not started.
+func SetReportLoadpoints(count int) {
+	reportMu.Lock()
+	reportLoadpoints = count
+	reportMu.Unlock()
+
+	if ReportEnabled() {
+		ApplyReportRules(ReportRules())
+	}
+}
+
 // ValidateReportRules returns an error for the first rule that must not dial.
 func ValidateReportRules(rules []ReportRule) error {
-	_, refused := splitReportRules(rules, forwardedIdentities())
+	reportMu.RLock()
+	loadpoints := reportLoadpoints
+	reportMu.RUnlock()
+
+	_, refused := splitReportRules(rules, forwardedIdentities(), loadpoints)
 	for _, r := range rules {
 		if msg, ok := refused[r.LoadpointId]; ok {
 			return fmt.Errorf("%s: %s", r.LoadpointTitle, msg)
@@ -298,7 +320,7 @@ func ApplyReportRules(rules []ReportRule) {
 
 	reportMu.Lock()
 	reportRules = rules
-	active, refused := splitReportRules(rules, forwarded)
+	active, refused := splitReportRules(rules, forwarded, reportLoadpoints)
 
 	// while globally disabled, valid stays empty: every existing connection
 	// below is torn down as stale and none get (re)started, but reportRules
