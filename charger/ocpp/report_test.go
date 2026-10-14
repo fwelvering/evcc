@@ -246,8 +246,8 @@ func restoreRule(id int) ReportRule {
 	return ReportRule{LoadpointId: id, UpstreamURL: "ws://example.invalid", StationID: "s", IdTag: "t"}
 }
 
-// An open transaction outlived the process, so the restart ends it at the last reported value
-func TestRestoreEndsOpenTransaction(t *testing.T) {
+// An open transaction outlived the process: it stays open for the next session to continue
+func TestRestoreKeepsOpenTransaction(t *testing.T) {
 	at := time.Date(2026, 10, 6, 20, 0, 0, 0, time.UTC)
 	txn := 7
 	reportStore.save(10, persistedReportState{TransactionId: &txn, LastWh: 1500, LastAt: at})
@@ -257,10 +257,77 @@ func TestRestoreEndsOpenTransaction(t *testing.T) {
 	defer conn.mu.Unlock()
 	require.NotNil(t, conn.transactionId)
 	assert.Equal(t, 7, *conn.transactionId)
+	assert.Empty(t, conn.events)
+	assert.True(t, conn.resumable)
+	conn.resumeTimer.Stop()
+}
+
+func TestResumeContinuesTransaction(t *testing.T) {
+	txn := 9
+	reportStore.save(13, persistedReportState{TransactionId: &txn, LastWh: 500, LastAt: time.Now()})
+
+	conn := newReportConnection(restoreRule(13))
+	assert.True(t, conn.tryResume())
+	assert.False(t, conn.tryResume())
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	assert.True(t, conn.sessionActive)
+	assert.Empty(t, conn.events)
+	require.NotNil(t, conn.transactionId)
+	assert.Equal(t, 9, *conn.transactionId)
+}
+
+// Without a session coming back the restored transaction ends at its last value
+func TestEndResumableStopsTransaction(t *testing.T) {
+	at := time.Date(2026, 10, 6, 20, 0, 0, 0, time.UTC)
+	txn := 10
+	reportStore.save(14, persistedReportState{TransactionId: &txn, LastWh: 700, LastAt: at})
+
+	conn := newReportConnection(restoreRule(14))
+	conn.cp = newUnstartedConnection("x").cp
+	conn.endResumable()
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	assert.False(t, conn.resumable)
 	require.Len(t, conn.events, 1)
 	assert.Equal(t, reportEventStop, conn.events[0].kind)
-	assert.Equal(t, 1500.0, conn.events[0].wh)
+	assert.Equal(t, 700.0, conn.events[0].wh)
 	assert.Equal(t, at, conn.events[0].at)
+}
+
+// A start that never reached the upstream is kept and gets its stop when nothing resumes
+func TestEndResumableClosesUnconfirmedStart(t *testing.T) {
+	at := time.Date(2026, 10, 6, 20, 0, 0, 0, time.UTC)
+	reportStore.save(15, persistedReportState{
+		LastWh: 300,
+		LastAt: at,
+		Events: []persistedEvent{{Kind: reportEventStart, At: at, Wh: 300}},
+	})
+
+	conn := newReportConnection(restoreRule(15))
+	conn.cp = newUnstartedConnection("x").cp
+	require.True(t, conn.resumable)
+	conn.endResumable()
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	require.Len(t, conn.events, 2)
+	assert.Equal(t, reportEventStart, conn.events[0].kind)
+	assert.Equal(t, reportEventStop, conn.events[1].kind)
+}
+
+// A transaction id belongs to the upstream that issued it
+func TestRestoreIgnoresOtherUpstream(t *testing.T) {
+	txn := 11
+	reportStore.save(16, persistedReportState{Upstream: "ws://elsewhere|s", TransactionId: &txn, LastWh: 1, LastAt: time.Now()})
+
+	conn := newReportConnection(restoreRule(16))
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	assert.Nil(t, conn.transactionId)
+	assert.False(t, conn.resumable)
 }
 
 // A start that was already confirmed must not be sent again after a restart
@@ -280,9 +347,9 @@ func TestRestoreDoesNotResendConfirmedStart(t *testing.T) {
 	conn := newReportConnection(restoreRule(11))
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	require.Len(t, conn.events, 2)
+	require.Len(t, conn.events, 1)
 	assert.Equal(t, reportEventMeter, conn.events[0].kind)
-	assert.Equal(t, reportEventStop, conn.events[1].kind)
+	conn.resumeTimer.Stop()
 }
 
 // Session boundaries are saved as they are queued, so a restart keeps them

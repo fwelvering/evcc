@@ -49,6 +49,10 @@ var reportLog = util.NewLogger("ocpp-report")
 const (
 	defaultMeterInterval     = 60 * time.Second
 	defaultHeartbeatInterval = 5 * time.Minute
+
+	// resumeWindow is how long a session restored after a restart waits for the
+	// loadpoint to start its next session before the transaction is ended
+	resumeWindow = 10 * time.Minute
 )
 
 // ReportRule configures reporting a loadpoint's charging sessions to an
@@ -72,6 +76,11 @@ type ReportRule struct {
 	Password string `json:"password,omitempty" yaml:"password,omitempty"`
 	Insecure bool   `json:"insecure,omitempty" yaml:"insecure,omitempty"`
 	CaCert   string `json:"caCert,omitempty" yaml:"caCert,omitempty"`
+}
+
+// upstreamIdentity names the upstream and station a transaction id belongs to
+func (r ReportRule) upstreamIdentity() string {
+	return strings.TrimRight(r.UpstreamURL, "/") + "|" + r.StationID
 }
 
 func (r ReportRule) Redacted() ReportRule {
@@ -365,6 +374,10 @@ type reportConnection struct {
 	lastAt        time.Time // when lastWh was taken
 	idTagStatus   string    // last idTag status the upstream answered with
 
+	// a session restored after a restart waits for the loadpoint's next session
+	resumable   bool
+	resumeTimer *time.Timer
+
 	// intermediate MeterValues throttle - reconcile always runs on this
 	// connection's single worker goroutine (run's job loop), so these two are
 	// only ever touched from there and need no mutex, unlike the fields above
@@ -551,6 +564,12 @@ func (conn *reportConnection) dial() {
 }
 
 func (conn *reportConnection) close() {
+	conn.mu.Lock()
+	if conn.resumeTimer != nil {
+		conn.resumeTimer.Stop()
+	}
+	conn.mu.Unlock()
+
 	close(conn.done)
 	conn.cp.Stop()
 }
@@ -815,6 +834,13 @@ func ReportSessionStart(loadpointId int, meterStartWh float64) {
 	conn := connections[loadpointId]
 	reportMu.RUnlock()
 	if conn == nil {
+		return
+	}
+
+	if conn.tryResume() {
+		reportLog.INFO.Printf("%s: session continues the transaction from before the restart", conn.title)
+		conn.enqueue(conn.reconcile)
+		conn.enqueue(func() { conn.sendStatus(core.ChargePointStatusCharging) })
 		return
 	}
 
