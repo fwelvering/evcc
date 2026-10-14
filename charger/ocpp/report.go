@@ -209,18 +209,91 @@ func clearReportError(id int) {
 	}
 }
 
+// forwardedIdentities returns the station ids the forwarder presents to its upstreams.
+// Some upstreams relay on to a leading backoffice, so a report under one of these ids
+// would collide with the forwarder there.
+func forwardedIdentities() map[string]bool {
+	forwarderMu.RLock()
+	rules := slices.Clone(forwarderRules)
+	forwarderMu.RUnlock()
+
+	ids := make(map[string]bool)
+	wildcard := false
+	for _, r := range rules {
+		if r.StationID == "*" {
+			wildcard = true
+			if r.UpstreamStationID != "" {
+				ids[strings.TrimLeft(r.UpstreamStationID, "/")] = true
+			}
+			continue
+		}
+		ids[strings.TrimLeft(r.upstreamPath(r.StationID), "/")] = true
+	}
+
+	if wildcard {
+		sidecarsMu.Lock()
+		for id := range connectedChargers {
+			ids[id] = true
+		}
+		sidecarsMu.Unlock()
+	}
+
+	return ids
+}
+
+// splitReportRules separates the rules that may dial from those that must not, keyed
+// by loadpoint id: a rule is refused when its station id is one the forwarder uses,
+// or when an earlier rule already dials the same upstream under the same station id.
+func splitReportRules(rules []ReportRule, forwarded map[string]bool) (active []ReportRule, refused map[int]string) {
+	refused = make(map[int]string)
+	dialed := make(map[string]bool)
+
+	for _, r := range rules {
+		key := strings.TrimRight(r.UpstreamURL, "/") + "|" + r.StationID
+		switch {
+		case forwarded[r.StationID]:
+			refused[r.LoadpointId] = fmt.Sprintf("station id %s is used by the OCPP forwarder, the report needs its own", r.StationID)
+		case dialed[key]:
+			refused[r.LoadpointId] = fmt.Sprintf("station id %s is already reported to this upstream by another rule", r.StationID)
+		default:
+			dialed[key] = true
+			active = append(active, r)
+		}
+	}
+
+	for _, r := range active {
+		delete(refused, r.LoadpointId)
+	}
+
+	return active, refused
+}
+
+// ValidateReportRules returns an error for the first rule that must not dial.
+func ValidateReportRules(rules []ReportRule) error {
+	_, refused := splitReportRules(rules, forwardedIdentities())
+	for _, r := range rules {
+		if msg, ok := refused[r.LoadpointId]; ok {
+			return fmt.Errorf("%s: %s", r.LoadpointTitle, msg)
+		}
+	}
+	return nil
+}
+
 // ApplyReportRules replaces the report rules and (re)dials connections.
 func ApplyReportRules(rules []ReportRule) {
+	forwarded := forwardedIdentities()
+
 	reportMu.Lock()
 	reportRules = rules
+	active, refused := splitReportRules(rules, forwarded)
 
 	// while globally disabled, valid stays empty: every existing connection
 	// below is torn down as stale and none get (re)started, but reportRules
 	// still holds the real config for status/config endpoints and for
 	// SetReportEnabled to reconnect from once re-enabled
-	valid := make(map[int]bool, len(rules))
+	valid := make(map[int]bool, len(active))
 	if reportEnabled {
-		for _, r := range rules {
+		for _, r := range active {
 			valid[r.LoadpointId] = true
 		}
 	}
@@ -234,9 +307,19 @@ func ApplyReportRules(rules []ReportRule) {
 		}
 	}
 
+	if reportEnabled {
+		for _, r := range active {
+			reportLog.INFO.Printf("%s: report rule %s as %s", r.LoadpointTitle, r.UpstreamURL, r.StationID)
+		}
+		for id, msg := range refused {
+			reportLog.ERROR.Printf("loadpoint %d: report rule not started: %s", id, msg)
+			reportErrors[id] = msg
+		}
+	}
+
 	var toStart []*reportConnection
 	if reportEnabled {
-		for _, r := range rules {
+		for _, r := range active {
 			if old, ok := connections[r.LoadpointId]; ok {
 				if old.rule.sameConnection(r) {
 					old.rule = r // idTag etc. may have changed, doesn't need a reconnect

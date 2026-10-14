@@ -111,6 +111,11 @@ func ApplyForwarderRules(rules []ForwarderRule) {
 	}
 
 	notifyUpdated()
+
+	// report rules must keep clear of the ids the forwarder now uses
+	if ReportEnabled() {
+		ApplyReportRules(ReportRules())
+	}
 }
 
 // dialUpstream opens a websocket connection to the rule's upstream server for the given charger.

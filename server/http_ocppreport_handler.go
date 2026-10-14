@@ -39,6 +39,11 @@ func updateOcppReportHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if err := ocpp.ValidateReportRules(rules); err != nil {
+		jsonError(w, http.StatusBadRequest, err)
+		return
+	}
+
 	// restore masked secrets (password, caCert) from stored rules by loadpoint id
 	var old []ocpp.ReportRule
 	if err := settings.Json(keys.OcppReport, &old); err == nil {
