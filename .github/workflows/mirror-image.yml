@@ -17,6 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # the build derives its version number from the latest tag, forks may lack them
+      - name: Fetch upstream tags
+        run: git fetch --tags --force https://github.com/evcc-io/evcc.git
 
       - uses: docker/setup-qemu-action@v3
 
