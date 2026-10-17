@@ -11,7 +11,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +51,7 @@ func (m MirrorRule) Key() string {
 // ConnectionKey identifies the upstream station the mirror reaches for a charger. An
 // omitted station id means the charger's own id.
 func (m MirrorRule) ConnectionKey(chargerID string) string {
-	return strings.TrimRight(m.UpstreamURL, "/") + "|" + strings.TrimLeft(m.dialRule(chargerID).upstreamPath(chargerID), "/")
+	return m.dialRule(chargerID).ConnectionKey(chargerID)
 }
 
 // ConnectionKey identifies the upstream station the rule's main connection reaches for a charger.
@@ -96,12 +98,10 @@ func (m MirrorRule) dialRule(chargerID string) ForwarderRule {
 
 // MirrorStatus is the observable state of one mirror.
 type MirrorStatus struct {
-	UpstreamURL       string       `json:"upstreamUrl"`
-	UpstreamStationID string       `json:"upstreamStationId,omitempty"`
-	UpstreamConnected bool         `json:"upstreamConnected"`
-	Error             string       `json:"error,omitempty"`
-	LastSent          *time.Time   `json:"lastSent,omitempty"`
-	History           []MirrorHour `json:"history,omitempty"`
+	UpstreamURL       string `json:"upstreamUrl"`
+	UpstreamStationID string `json:"upstreamStationId,omitempty"`
+	UpstreamConnected bool   `json:"upstreamConnected"`
+	Error             string `json:"error,omitempty"`
 }
 
 // mirrorFrame is a Call of the charger waiting to be written to a mirror.
@@ -122,10 +122,12 @@ type mirrorSession struct {
 	rule      MirrorRule
 	out       chan mirrorFrame
 	stop      chan struct{}
-	connected bool // guarded by mirrorsMu
+	done      chan struct{} // closed when the session's goroutine has ended
+	connected bool          // guarded by mirrorsMu
 
-	// frame whose write failed, sent first after the next connect; only used by the session's goroutine
-	retry *mirrorFrame
+	// only used by the session's goroutine
+	retry   *mirrorFrame // frame whose write failed, sent first after the next connect
+	counter mirrorCounter
 }
 
 var (
@@ -144,11 +146,9 @@ var (
 	mirrorSeq uint64
 )
 
-// startMirrors aligns the mirrors of a charger with its current rule: new ones are
-// dialled, changed ones redialled and removed ones closed. The rule is resolved and
-// the sessions are installed under the same locks that guard the charger's
-// connection state and the other reconciliations, so a charger that disconnected
-// meanwhile gets none and an older reconciliation cannot overwrite a newer one.
+// startMirrors aligns the mirrors of a charger with its current rule. Rule lookup and
+// installation happen under the connection-state locks, so a disconnected charger gets
+// none and reconciliations cannot overwrite each other.
 func startMirrors(chargerID string) {
 	sidecarsMu.Lock()
 	connected := connectedChargers[chargerID]
@@ -207,6 +207,7 @@ func syncMirrorsLocked(chargerID string, rules []MirrorRule) (stale, fresh []*mi
 			rule:      r,
 			out:       make(chan mirrorFrame, mirrorBacklog),
 			stop:      make(chan struct{}),
+			done:      make(chan struct{}),
 		}
 		running[key] = ms
 		fresh = append(fresh, ms)
@@ -332,9 +333,7 @@ func (ms *mirrorSession) setState(connected bool, err error) {
 	}
 
 	mirrorsMu.Lock()
-	if ms.connected && !connected {
-		ms.recordDisconnectLocked(time.Now())
-	}
+	lost := ms.connected && !connected
 	ms.connected = connected
 
 	if mirrorErrors[ms.chargerID] == nil {
@@ -347,11 +346,17 @@ func (ms *mirrorSession) setState(connected bool, err error) {
 	}
 	mirrorsMu.Unlock()
 
+	if lost {
+		ms.countDisconnect(time.Now())
+	}
+
 	notifyUpdated()
 }
 
 // run keeps the mirror connected until it is stopped, redialling with backoff.
 func (ms *mirrorSession) run() {
+	defer close(ms.done)
+
 	bo := backoff.NewExponentialBackOff(
 		backoff.WithInitialInterval(reconnectInitialDelay),
 		backoff.WithMaxInterval(reconnectMaxDelay),
@@ -388,25 +393,27 @@ func (ms *mirrorSession) serve() bool {
 
 	forwarderLog.INFO.Printf("mirror %s → %s (read-only)", ms.chargerID, strings.TrimRight(ms.rule.UpstreamURL, "/")+ms.rule.dialRule(ms.chargerID).upstreamPath(ms.chargerID))
 
-	defer flushMirrorStats()
+	// send writes a frame and tears the connection down on failure
+	send := func(frame []byte) bool {
+		if err := writeFrame(conn, frame); err != nil {
+			forwarderLog.DEBUG.Printf("mirror %s: write: %v", ms.chargerID, err)
+			conn.CloseNow()
+			ms.setState(false, err)
+			return false
+		}
+		ms.count(frame, time.Now())
+		return true
+	}
 
 	frames, snapshot := ms.replayFrames()
 	for _, frame := range frames {
-		if err := writeFrame(conn, frame); err != nil {
-			conn.CloseNow()
-			ms.setState(false, err)
+		if !send(frame) {
 			return true
 		}
-		ms.record(frame, time.Now())
 	}
 
-	if retry := ms.retry; retry != nil && !retry.superseded(snapshot) {
-		if err := writeFrame(conn, retry.data); err != nil {
-			conn.CloseNow()
-			ms.setState(false, err)
-			return true
-		}
-		ms.record(retry.data, time.Now())
+	if retry := ms.retry; retry != nil && !retry.superseded(snapshot) && !send(retry.data) {
+		return true
 	}
 	ms.retry = nil
 
@@ -415,17 +422,11 @@ func (ms *mirrorSession) serve() bool {
 	readErr := make(chan error, 1)
 	go func() { readErr <- ms.rejectCalls(conn) }()
 
-	flush := time.NewTicker(time.Minute)
-	defer flush.Stop()
-
 	for {
 		select {
 		case <-ms.stop:
 			conn.Close(websocket.StatusNormalClosure, "")
 			return true
-
-		case <-flush.C:
-			flushMirrorStats()
 
 		case err := <-readErr:
 			forwarderLog.DEBUG.Printf("mirror %s: upstream disconnected: %v", ms.chargerID, err)
@@ -438,14 +439,10 @@ func (ms *mirrorSession) serve() bool {
 				continue
 			}
 
-			if err := writeFrame(conn, frame.data); err != nil {
-				forwarderLog.DEBUG.Printf("mirror %s: write: %v", ms.chargerID, err)
+			if !send(frame.data) {
 				ms.retry = &frame
-				conn.CloseNow()
-				ms.setState(false, err)
 				return true
 			}
-			ms.record(frame.data, time.Now())
 		}
 	}
 }
@@ -498,20 +495,106 @@ func mirrorStatus(chargerID string, rules []MirrorRule) []MirrorStatus {
 			st.Error = msg
 		}
 
-		stats := statsLocked(mirrorStatsKey(chargerID, r.Key()))
-		if !stats.LastSent.IsZero() {
-			lastSent := stats.LastSent
-			st.LastSent = &lastSent
-		}
-
-		hours := stats.Hours
-		if len(hours) > mirrorStatusHours {
-			hours = hours[len(hours)-mirrorStatusHours:]
-		}
-		st.History = slices.Clone(hours)
-
 		out = append(out, st)
 	}
 
 	return out
+}
+
+// maxEnergyStepWh: a larger step of the energy register is a reset or a gap, not delivered energy
+const maxEnergyStepWh = 100_000
+
+// mirrorCounter counts what was written to a mirror's upstream within the current hour.
+// It exists for the log line written when the hour ends, to compare with the upstream.
+type mirrorCounter struct {
+	hour        time.Time
+	messages    int
+	meterValues int
+	energyWh    float64
+	lastWh      float64
+	disconnects int
+}
+
+// roll starts the hour containing now and logs the previous one.
+func (ms *mirrorSession) roll(now time.Time) {
+	c := &ms.counter
+
+	hour := now.Truncate(time.Hour)
+	if c.hour.Equal(hour) {
+		return
+	}
+
+	if !c.hour.IsZero() {
+		forwarderLog.INFO.Printf("mirror %s: %s: %d messages (%d meter values), %.3f kWh, %d disconnects",
+			ms.chargerID, c.hour.Local().Format("02 Jan 15h"), c.messages, c.meterValues, c.energyWh/1e3, c.disconnects)
+	}
+
+	*c = mirrorCounter{hour: hour, lastWh: c.lastWh}
+}
+
+// count records a frame that was written to the mirror's upstream.
+func (ms *mirrorSession) count(frame []byte, now time.Time) {
+	ms.roll(now)
+
+	c := &ms.counter
+	c.messages++
+
+	if _, _, action, err := parseOCPPFrame(frame); err != nil || action != "MeterValues" {
+		return
+	}
+	c.meterValues++
+
+	if wh, ok := meterEnergyWh(frame); ok {
+		if step := wh - c.lastWh; c.lastWh > 0 && step >= 0 && step <= maxEnergyStepWh {
+			c.energyWh += step
+		}
+		c.lastWh = wh
+	}
+}
+
+// countDisconnect records a lost connection.
+func (ms *mirrorSession) countDisconnect(now time.Time) {
+	ms.roll(now)
+	ms.counter.disconnects++
+}
+
+// meterEnergyWh returns the active import energy register of a MeterValues frame in Wh.
+func meterEnergyWh(frame []byte) (float64, bool) {
+	var msg []json.RawMessage
+	if json.Unmarshal(frame, &msg) != nil || len(msg) < 4 {
+		return 0, false
+	}
+
+	var payload struct {
+		MeterValue []struct {
+			SampledValue []struct {
+				Value     string `json:"value"`
+				Measurand string `json:"measurand"`
+				Unit      string `json:"unit"`
+				Phase     string `json:"phase"`
+			} `json:"sampledValue"`
+		} `json:"meterValue"`
+	}
+	if json.Unmarshal(msg[3], &payload) != nil {
+		return 0, false
+	}
+
+	for _, mv := range payload.MeterValue {
+		for _, sv := range mv.SampledValue {
+			if sv.Phase != "" || (sv.Measurand != "" && sv.Measurand != "Energy.Active.Import.Register") {
+				continue
+			}
+
+			f, err := strconv.ParseFloat(sv.Value, 64)
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+				continue
+			}
+			if sv.Unit == "kWh" {
+				f *= 1e3
+			}
+			return f, true
+		}
+	}
+
+	return 0, false
 }
